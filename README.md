@@ -53,10 +53,14 @@ cb open https://example.com                  # 裏のタブで開く
 
 ### エージェント用のスキル
 
-Claude Code から使う場合は、同梱のスキルを `~/.claude/skills/` にリンクします。
+`cb` はふつうのコマンドなので、シェルを実行できるエージェントならどれからでも使えます。同梱のスキルをリンクしておくと、操作の許可範囲や手順をエージェントが自分で読みます。
 
 ```bash
+# Claude Code
 ln -s "$(npm root -g)/chrome-bridge/skills/chrome-bridge" ~/.claude/skills/chrome-bridge
+
+# Codex
+ln -s "$(npm root -g)/chrome-bridge/skills/chrome-bridge" ~/.codex/skills/chrome-bridge
 ```
 
 ## 更新
