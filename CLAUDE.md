@@ -4,5 +4,6 @@
 
 - 仕様は [docs/spec.md](docs/spec.md)。構成、メッセージ形式、コマンド、ガードはここだけに書く。
 - 使い方と操作の許可範囲は、同梱のスキル [skills/chrome-bridge/SKILL.md](skills/chrome-bridge/SKILL.md) に書く。
+- 不具合や足りない操作を直すときは、先に `docs/spec.md` を直してから実装する。直したら `cb reload` して `cb selftest` で確かめる。
 - 依存パッケージは入れない（Node標準のみ）。テストは案件直下で `node --test`。
 - 一時ファイルは `tmp/`。
