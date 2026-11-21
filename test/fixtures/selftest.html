@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>chrome-bridge selftest</title>
+  <style>
+    body { min-height: 1800px; }
+    #hover-result { display: none; }
+    #hover-target:hover + #hover-result { display: block; }
+  </style>
+</head>
+<body>
+  <button id="xy" type="button" style="position:fixed;left:10px;top:10px;width:100px;height:30px;z-index:1000">座標クリック</button>
+  <pre id="state">{}</pre>
+  <h1>chrome-bridge selftest</h1>
+  <button id="toggle" type="button">表示切替</button>
+  <p id="toggle-result" hidden>表示されました</p>
+  <button id="real-click" type="button">実クリック</button>
+  <form action="/submit" method="post">
+    <label for="text-input">テキスト入力</label>
+    <input id="text-input" name="text" aria-label="テキスト入力">
+    <button type="submit">送信</button>
+  </form>
+  <label for="real-input">実入力</label>
+  <input id="real-input" aria-label="実入力">
+  <button id="outside" type="button">form外ボタン</button>
+  <div id="hover-target" role="button" tabindex="0">ホバー対象</div>
+  <div id="hover-result">ホバー表示</div>
+  <script>
+    new MutationObserver(() => {
+      document.querySelector('#state').textContent = JSON.stringify(document.body.dataset);
+    }).observe(document.body, { attributes: true });
+    document.querySelector('#xy').addEventListener('click', (event) => {
+      document.body.dataset.xyClicked = String(event.isTrusted);
+    });
+    document.querySelector('#toggle').addEventListener('click', () => {
+      document.querySelector('#toggle-result').hidden = false;
+      document.body.dataset.clicked = 'true';
+    });
+    document.querySelector('#real-click').addEventListener('click', (event) => {
+      document.body.dataset.realClicked = String(event.isTrusted);
+    });
+    document.querySelector('#outside').addEventListener('click', () => {
+      document.body.dataset.outsideClicked = 'true';
+    });
+    document.querySelector('#text-input').addEventListener('input', (event) => {
+      document.body.dataset.textValue = event.target.value;
+    });
+    document.querySelector('#real-input').addEventListener('input', (event) => {
+      document.body.dataset.realValue = event.target.value;
+    });
+    document.querySelector('form').addEventListener('submit', () => {
+      document.body.dataset.submitted = 'true';
+    });
+    document.querySelector('#hover-target').addEventListener('mouseenter', () => {
+      document.body.dataset.hovered = 'true';
+    });
+    document.addEventListener('scroll', () => {
+      document.body.dataset.scrolled = 'true';
+    });
+    document.addEventListener('keydown', (event) => {
+      document.body.dataset.key = event.key;
+    });
+    window.runDebugSignals = () => {
+      if (document.body.dataset.debugSignals) return Promise.resolve();
+      document.body.dataset.debugSignals = 'true';
+      console.log('selftest-console');
+      return fetch('/probe').then(() => { document.body.dataset.fetched = 'true'; });
+    };
+  </script>
+</body>
+</html>

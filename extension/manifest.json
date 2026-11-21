@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Bridge",
+  "version": "1.0.0",
+  "description": "Local bridge for controlled browser access",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmD05U4W2WrjqsdlpPBq7wdpfYccHGAOaLXpvrh4h0CbZr1XNrkeMfFY9KEmmLORa6PsQDQ06xvYJcPn/5ElSfncX1gsTALwWClqUlF4oQs6zhbrYd14dZHxft+6WmGVmJF9MoXUCXMl/wFWxXXCzQm1Qo/0TZF2s1cE9564fdCa3FtjZnA8ZoBOixegzpoR0ew3XBB1FbKkSRSuivSh/MxNHLawCchgGlCx8I752/6Qa0oAizcARLD/j1mSsXwP81KboeAWSHzVTlP+Vslft4WGU2tytupynt3AzWZ7syDPodWxytWumtBn/5ePO1rnSKRprv+cVpxWxHQDziHrjnwIDAQAB",
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "identity",
+    "identity.email",
+    "alarms",
+    "storage",
+    "nativeMessaging",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "incognito": "spanning",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

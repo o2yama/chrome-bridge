@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>Chrome Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+  <script src="popup.js" defer></script>
+</head>
+<body>
+  <h1>Chrome Bridge</h1>
+  <dl>
+    <dt>ホスト</dt><dd id="connection">確認中…</dd>
+    <dt>メール</dt><dd id="email">—</dd>
+    <dt>拡張バージョン</dt><dd id="extension-version">—</dd>
+    <dt>Chromeバージョン</dt><dd id="chrome-version">—</dd>
+    <dt>確認状況</dt><dd id="verification">確認中…</dd>
+  </dl>
+  <p id="message" role="status" aria-live="polite"></p>
+  <button id="selftest" disabled>このChromeで動作確認</button>
+  <button id="reload">拡張機能を再読み込み</button>
+</body>
+</html>

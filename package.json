@@ -1,0 +1,25 @@
+{
+  "name": "chrome-bridge",
+  "version": "1.0.0",
+  "description": "Chrome拡張とCLI cb で、起動中のChrome系ブラウザを読み取り中心に操作する",
+  "private": true,
+  "license": "MIT",
+  "bin": {
+    "cb": "bin/cb"
+  },
+  "files": [
+    "bin/",
+    "host/host.js",
+    "extension/",
+    "skills/",
+    "test/fixtures/selftest.html",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,11 @@
+:root { color-scheme: light; font-family: system-ui, sans-serif; color: #3D2B24; background: #F4F3EE; }
+body { box-sizing: border-box; width: 280px; margin: 0; padding: 18px; }
+h1 { font-size: 18px; margin: 0 0 18px; }
+dl { margin: 0; font-size: 12px; }
+dt { margin-top: 12px; }
+dd { margin: 3px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+button { width: 100%; margin-top: 8px; padding: 10px 6px; border: 1px solid #D97757; border-radius: 6px; background: #F4F3EE; color: #3D2B24; cursor: pointer; }
+#selftest { background: #D97757; }
+button:disabled { opacity: .55; cursor: default; }
+button:focus-visible { outline: 2px solid #3D2B24; outline-offset: 2px; }
+#message { font-size: 12px; overflow-wrap: anywhere; }

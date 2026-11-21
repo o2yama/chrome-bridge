@@ -1,0 +1,812 @@
+#!/usr/bin/env node
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const net = require('node:net');
+const { randomUUID } = require('node:crypto');
+
+const projectRoot = path.resolve(__dirname, '..');
+const bridgeHome = process.env.CHROME_BRIDGE_HOME || path.join(os.homedir(), '.chrome-bridge');
+const runDir = path.join(bridgeHome, 'run');
+const failuresPath = path.join(bridgeHome, 'log/failures.jsonl');
+const recordedCodes = new Set([
+  'INTERNAL', 'TIMEOUT', 'TAB_NOT_RESPONDING', 'DEBUGGER_FAILED',
+  'CANNOT_ACCESS_PAGE', 'STALE_REF',
+]);
+
+class CliError extends Error {
+  constructor(message, code = 2) {
+    super(message);
+    this.exitCode = code;
+  }
+}
+
+const commandUsage = {
+  install: 'cb install',
+  browsers: 'cb browsers [--json]',
+  label: 'cb label -b <sel> <名前>',
+  tabs: 'cb tabs [-b <sel>] [--json]',
+  open: 'cb open [-b <sel>] <url> [--tab <id>] [--front] [--new]',
+  nav: 'cb nav -b <sel> -t <id> (--back | --forward | --reload [--no-cache])',
+  close: 'cb close -b <sel> -t <id>',
+  read: 'cb read -b <sel> -t <id> [--html] [--selector S] [--all-frames] [--offset N] [--max-chars N]',
+  elements: 'cb elements -b <sel> -t <id> [--viewport] [--json]',
+  scroll: 'cb scroll -b <sel> -t <id> (--by Y | --top | --bottom | --ref N | --selector S)',
+  click: 'cb click -b <sel> -t <id> (--ref N | --xy X,Y) [--real] [--user-approved] [--allow-input]',
+  type: 'cb type -b <sel> -t <id> --ref N --text "..." --user-instructed [--real]',
+  hover: 'cb hover -b <sel> -t <id> --ref N',
+  key: 'cb key -b <sel> -t <id> <key> [--user-approved] [--allow-input]',
+  debug: 'cb debug (start | stop) -b <sel> -t <id>',
+  console: 'cb console -b <sel> -t <id> [--pattern RE] [--clear] [--json]',
+  network: 'cb network -b <sel> -t <id> [--pattern RE] [--clear] [--json] | --detail <requestId> [--max-chars N]',
+  eval: 'cb eval -b <sel> -t <id> <式>',
+  screenshot: 'cb screenshot -b <sel> -t <id> --out <path.png> [--full]',
+  emulate: 'cb emulate -b <sel> -t <id> [--preset sp|tablet|pc] [--size WxH] [--dpr N] [--mobile] [--touch] [--color-scheme light|dark] [--reduced-motion] [--reset] [--json]',
+  inspect: 'cb inspect -b <sel> -t <id> (--selector <css> | --ref N) [--props a,b,c] [--rules] [--json]',
+  style: "cb style (add --css '<css>' | clear [--id <id>]) -b <sel> -t <id> [--json]",
+  perf: 'cb perf -b <sel> -t <id> [--json]',
+  doctor: 'cb doctor [--json]',
+  selftest: 'cb selftest -b <sel>',
+  activate: 'cb activate -b <sel> -t <id>',
+  reload: 'cb reload [-b <sel>]',
+};
+
+function usage(message) {
+  throw new CliError(message || '使い方が正しくありません');
+}
+
+function parseOptions(argv, definitions) {
+  const options = {};
+  const positionals = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    const definition = definitions[token];
+    if (!definition) {
+      if (token.startsWith('-')) usage(`不明なオプション: ${token}`);
+      positionals.push(token);
+      continue;
+    }
+    if (definition === true) {
+      options[token] = true;
+      continue;
+    }
+    const value = argv[index + 1];
+    if (value === undefined) usage(`${token} には値が必要です`);
+    options[token] = value;
+    index += 1;
+  }
+  return { options, positionals };
+}
+
+function integer(value, option) {
+  if (value === undefined || !/^-?\d+$/.test(value)) usage(`${option} には整数が必要です`);
+  return Number(value);
+}
+
+function connect(socketPath) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    // チャンク境界で多バイト文字が割れて文字化けしないよう、デコードはソケットに任せる。
+    socket.setEncoding('utf8');
+    socket.once('connect', () => resolve(socket));
+    socket.once('error', reject);
+  });
+}
+
+function request(socket, cmd, args = {}) {
+  return new Promise((resolve, reject) => {
+    const id = randomUUID();
+    let buffered = '';
+    const onData = (chunk) => {
+      buffered += chunk;
+      for (;;) {
+        const newline = buffered.indexOf('\n');
+        if (newline < 0) return;
+        const line = buffered.slice(0, newline);
+        buffered = buffered.slice(newline + 1);
+        let response;
+        try {
+          response = JSON.parse(line);
+        } catch (error) {
+          cleanup();
+          reject(error);
+          return;
+        }
+        if (response.id !== id) continue;
+        cleanup();
+        resolve(response);
+        return;
+      }
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error('hostとの接続が切れました'));
+    };
+    const cleanup = () => {
+      socket.off('data', onData);
+      socket.off('error', onError);
+      socket.off('close', onClose);
+    };
+    socket.on('data', onData);
+    socket.once('error', onError);
+    socket.once('close', onClose);
+    socket.write(`${JSON.stringify({ id, cmd, args })}\n`);
+  });
+}
+
+function profileName(browser) {
+  const relative = browser.browserApp === 'Google Chrome'
+    ? 'Library/Application Support/Google/Chrome'
+    : browser.browserApp === 'Arc'
+      ? 'Library/Application Support/Arc/User Data'
+      : null;
+  if (!relative || !browser.email) return '';
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(os.homedir(), relative, 'Local State'), 'utf8'));
+    const profiles = Object.values(state.profile?.info_cache || {});
+    return profiles.find((profile) => profile.user_name === browser.email)?.name || '';
+  } catch {
+    return '';
+  }
+}
+
+async function discover() {
+  let names;
+  try {
+    names = fs.readdirSync(runDir).filter((name) => name.endsWith('.sock'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  const found = await Promise.all(names.map(async (name) => {
+    const socketPath = path.join(runDir, name);
+    try {
+      const socket = await connect(socketPath);
+      const response = await request(socket, 'hello');
+      if (!response.ok) {
+        socket.destroy();
+        return null;
+      }
+      const browser = { ...response.result };
+      browser.profileName = profileName(browser);
+      return { socket, browser };
+    } catch {
+      try {
+        fs.unlinkSync(socketPath);
+      } catch {}
+      return null;
+    }
+  }));
+  return found.filter(Boolean);
+}
+
+function browserLine(browser) {
+  return [
+    browser.instanceId.slice(0, 8),
+    browser.browserApp,
+    browser.profileName,
+    browser.email,
+    browser.label,
+    `${browser.windows?.normal || 0}/${browser.windows?.incognito || 0}`,
+    browser.tabCount,
+    String(Boolean(browser.incognitoAllowed)),
+  ].join('\t');
+}
+
+function candidates(entries) {
+  return entries.map(({ browser }) => browserLine(browser)).join('\n');
+}
+
+function select(entries, selector) {
+  if (!selector) {
+    if (entries.length === 1) return entries[0];
+    if (entries.length === 0) throw new CliError('接続中のブラウザがありません', 1);
+    throw new CliError(`複数のブラウザが接続されています。-b で選択してください\n${candidates(entries)}`);
+  }
+  const needle = selector.toLowerCase();
+  const matches = entries.filter(({ browser }) =>
+    browser.instanceId.toLowerCase().startsWith(needle)
+    || [browser.email, browser.label, browser.profileName]
+      .some((value) => String(value || '').toLowerCase().includes(needle)));
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) throw new CliError(`一致するブラウザがありません: ${selector}`);
+  throw new CliError(`複数の候補に一致しました\n${candidates(matches)}`);
+}
+
+function closeEntries(entries) {
+  for (const entry of entries) entry.socket.destroy();
+}
+
+function printJson(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+function printResult(command, result, json) {
+  if (json) return printJson(result);
+  if (command === 'read') {
+    process.stdout.write(`${result.text || ''}\n`);
+    process.stderr.write(`# ${result.title} ${result.url} 全${result.totalChars}字${result.truncated ? '（続きあり。--offset で読む）' : ''}\n`);
+  }
+  else if (command === 'label') process.stdout.write(`${result.label}\n`);
+  else if (command === 'open' && result.reused) {
+    process.stdout.write(`既存タブを再利用\t${result.tabId}\t${result.title || ''}\t${result.url || ''}\n`);
+  }
+  else if (command === 'elements') {
+    for (const element of result.elements || []) {
+      const tag = [element.tag, element.type || element.role].filter(Boolean).join(':');
+      const form = element.inForm ? `form:${element.formMethod} ${element.formAction}` : '';
+      const state = element.disabled ? 'disabled' : '';
+      process.stdout.write(`${[element.ref, element.kind, tag, element.text || '', element.href || '', form, state].join('\t')}\n`);
+    }
+  } else if (command === 'tabs') {
+    for (const tab of result.tabs || []) {
+      const flags = `${tab.active ? '*' : ''}${tab.incognito ? '[secret]' : ''}${tab.discarded || tab.frozen ? '[sleep]' : ''}`;
+      process.stdout.write(`${tab.tabId}\t${flags}\t${tab.title || ''}\t${tab.url || ''}\n`);
+    }
+  } else {
+    printJson(result);
+  }
+}
+
+function urlHost(value) {
+  try {
+    return new URL(value).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
+function recordFailure(entry, cmd, args, error) {
+  if (!recordedCodes.has(error?.code)) return;
+  const record = {
+    at: new Date().toISOString(),
+    cmd,
+    code: error.code,
+    message: error.message,
+    cause: error.detail?.cause,
+    chromeVersion: entry.browser.chromeVersion,
+    browserApp: entry.browser.browserApp,
+    urlHost: urlHost(args.url || error.detail?.url),
+  };
+  for (const key of Object.keys(record)) {
+    if (record[key] === undefined) delete record[key];
+  }
+  fs.mkdirSync(path.dirname(failuresPath), { recursive: true });
+  let lines = [];
+  try {
+    lines = fs.readFileSync(failuresPath, 'utf8').split('\n').filter(Boolean);
+  } catch (readError) {
+    if (readError.code !== 'ENOENT') throw readError;
+  }
+  lines.push(JSON.stringify(record));
+  fs.writeFileSync(failuresPath, `${lines.slice(-500).join('\n')}\n`);
+}
+
+async function requestEntry(entry, cmd, args = {}) {
+  const response = await request(entry.socket, cmd, args);
+  if (!response.ok) recordFailure(entry, cmd, args, response.error);
+  return response;
+}
+
+async function sendSelected(entries, selector, cmd, args, json) {
+  const entry = select(entries, selector);
+  const response = await requestEntry(entry, cmd, args);
+  if (!response.ok) {
+    const error = new CliError(`${response.error.code}: ${response.error.message}`, 1);
+    error.remote = response.error;
+    error.json = json;
+    throw error;
+  }
+  return response.result;
+}
+
+function readFailures() {
+  try {
+    return fs.readFileSync(failuresPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+function verificationText(browser) {
+  const verified = browser.verified;
+  if (!verified) return '未確認';
+  if (!verified.ok) return `失敗: ${(verified.failures || []).join(', ')}`;
+  const currentMajor = String(browser.chromeVersion || '').split('.')[0];
+  const verifiedMajor = String(verified.chromeVersion || '').split('.')[0];
+  return currentMajor && currentMajor === verifiedMajor ? '確認済み' : '未確認';
+}
+
+function printDoctor(entries, failures, json) {
+  if (json) {
+    printJson({ browsers: entries.map(({ browser }) => browser), failures });
+    return;
+  }
+  for (const { browser } of entries) {
+    process.stdout.write(`${browserLine(browser)}\n`);
+    process.stdout.write(`  Chrome ${browser.chromeVersion || ''}\n`);
+    process.stdout.write(`  確認状況 ${verificationText(browser)}\n`);
+    process.stdout.write(`  デバッガ ${(browser.debugTabs || []).join(', ') || 'なし'}\n`);
+  }
+  process.stdout.write('失敗履歴（直近20件）\n');
+  for (const failure of failures) {
+    process.stdout.write(`${failure.at}\t${failure.browserApp || ''}\t${failure.chromeVersion || ''}\t${failure.cmd}\t${failure.code}\t${failure.message}\n`);
+  }
+}
+
+function writeIfChanged(file, content, mode) {
+  let existing;
+  try {
+    existing = fs.readFileSync(file, 'utf8');
+  } catch {}
+  if (existing !== content) fs.writeFileSync(file, content, mode ? { mode } : undefined);
+  if (mode) fs.chmodSync(file, mode);
+}
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function install() {
+  const extensionIdPath = path.join(projectRoot, 'extension/EXTENSION_ID');
+  let extensionId;
+  try {
+    extensionId = fs.readFileSync(extensionIdPath, 'utf8');
+  } catch {
+    throw new CliError(`extension/EXTENSION_ID がありません: ${extensionIdPath}`, 1);
+  }
+  if (!/^[^\r\n]{32}$/.test(extensionId)) {
+    throw new CliError('extension/EXTENSION_ID は改行なしの32文字である必要があります', 1);
+  }
+
+  const hostPath = path.join(projectRoot, 'host/host.js');
+  const runnerPath = path.join(projectRoot, 'host/run-host.sh');
+  const runner = `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(hostPath)}\n`;
+  writeIfChanged(runnerPath, runner, 0o755);
+
+  const manifest = `${JSON.stringify({
+    name: 'com.o2yama.chrome_bridge',
+    description: 'Chrome Bridge Native Messaging Host',
+    path: runnerPath,
+    type: 'stdio',
+    allowed_origins: [`chrome-extension://${extensionId}/`],
+  }, null, 2)}\n`;
+  const home = os.homedir();
+  const destinations = [
+    path.join(home, 'Library/Application Support/Google/Chrome'),
+    path.join(home, 'Library/Application Support/Arc/User Data'),
+  ];
+  for (const browserRoot of destinations) {
+    if (!fs.existsSync(browserRoot)) continue;
+    const hostsDir = path.join(browserRoot, 'NativeMessagingHosts');
+    fs.mkdirSync(hostsDir, { recursive: true });
+    const manifestPath = path.join(hostsDir, 'com.o2yama.chrome_bridge.json');
+    writeIfChanged(manifestPath, manifest);
+    process.stdout.write(`${manifestPath}\n`);
+  }
+  process.stdout.write([
+    '',
+    '続けて、使うプロファイルごとに拡張機能を読み込んでください。',
+    '1. chrome://extensions を開く',
+    '2. 「デベロッパー モード」をオンにする',
+    '3. 「パッケージ化されていない拡張機能を読み込む」で次のフォルダを選ぶ',
+    `   ${path.join(projectRoot, 'extension')}`,
+    '4. シークレットでも使うなら、拡張機能の「詳細」で「シークレット モードでの実行を許可する」をオンにする',
+    '',
+  ].join('\n'));
+}
+
+async function main() {
+  const [command, ...argv] = process.argv.slice(2);
+  if (command === '--help' || command === 'help' || (Object.hasOwn(commandUsage, command) && argv.length === 1 && argv[0] === '--help')) {
+    process.stdout.write(`${commandUsage[command] || Object.values(commandUsage).join('\n')}\n`);
+    return;
+  }
+  if (!command || !Object.hasOwn(commandUsage, command)) usage(`使い方:\n${Object.values(commandUsage).join('\n')}`);
+  if (command === 'install') {
+    if (argv.length) usage('cb install に引数はありません');
+    install();
+    return;
+  }
+
+  const entries = await discover();
+  try {
+    if (command === 'browsers') {
+      const { options, positionals } = parseOptions(argv, { '--json': true });
+      if (positionals.length) usage('cb browsers に位置引数はありません');
+      if (options['--json']) printJson(entries.map(({ browser }) => browser));
+      else for (const { browser } of entries) process.stdout.write(`${browserLine(browser)}\n`);
+      return;
+    }
+
+    if (command === 'label') {
+      const { options, positionals } = parseOptions(argv, { '-b': 'value' });
+      if (!options['-b'] || positionals.length !== 1) usage('使い方: cb label -b <sel> <名前>');
+      const result = await sendSelected(entries, options['-b'], 'setLabel', { label: positionals[0] }, false);
+      printResult('label', result, false);
+      return;
+    }
+
+    if (command === 'tabs') {
+      const { options, positionals } = parseOptions(argv, { '-b': 'value', '--json': true });
+      if (positionals.length) usage('cb tabs に位置引数はありません');
+      const targets = options['-b'] ? [select(entries, options['-b'])] : entries;
+      const results = [];
+      for (const entry of targets) {
+        const response = await requestEntry(entry, 'tabs', {});
+        if (!response.ok) {
+          const error = new CliError(`${response.error.code}: ${response.error.message}`, 1);
+          error.remote = response.error;
+          error.json = options['--json'];
+          throw error;
+        }
+        results.push({ browser: entry.browser, ...response.result });
+      }
+      if (options['--json']) printJson(options['-b'] ? results[0] : results);
+      else {
+        for (const result of results) {
+          process.stdout.write(`# ${browserLine(result.browser)}\n`);
+          printResult('tabs', result, false);
+        }
+      }
+      return;
+    }
+
+    const common = { '-b': 'value', '-t': 'value' };
+    if (command === 'open') {
+      const { options, positionals } = parseOptions(argv, {
+        '-b': 'value', '--tab': 'value', '--background': true, '--front': true, '--new': true,
+      });
+      if (positionals.length !== 1) usage('使い方: cb open [-b <sel>] <url> [--tab <tabId>] [--front] [--new]');
+      const args = { url: positionals[0] };
+      if (options['--tab'] !== undefined) args.tabId = integer(options['--tab'], '--tab');
+      if (options['--front']) args.front = true;
+      if (options['--new']) args.new = true;
+      const result = await sendSelected(entries, options['-b'], 'open', args, false);
+      printResult('open', result, false);
+      return;
+    }
+
+    if (command === 'nav') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--back': true, '--forward': true, '--reload': true, '--no-cache': true,
+      });
+      if (positionals.length) usage('cb nav に位置引数はありません');
+      const actions = ['--back', '--forward', '--reload'].filter((name) => options[name]);
+      if (actions.length !== 1) usage('navの操作を1つ指定してください');
+      if (options['--no-cache'] && !options['--reload']) usage('--no-cache は --reload と指定してください');
+      const result = await sendSelected(entries, options['-b'], 'nav', {
+        tabId: integer(options['-t'], '-t'),
+        action: actions[0].slice(2),
+        ...(options['--no-cache'] ? { noCache: true } : {}),
+      }, false);
+      printResult('nav', result, false);
+      return;
+    }
+
+    if (command === 'close') {
+      const { options, positionals } = parseOptions(argv, common);
+      if (positionals.length) usage('使い方: cb close -b <sel> -t <tabId>');
+      const result = await sendSelected(entries, options['-b'], 'close', {
+        tabId: integer(options['-t'], '-t'),
+      }, false);
+      printResult('close', result, false);
+      return;
+    }
+
+    if (command === 'emulate') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--preset': 'value', '--size': 'value', '--dpr': 'value', '--mobile': true,
+        '--touch': true, '--color-scheme': 'value', '--reduced-motion': true, '--reset': true, '--json': true,
+      });
+      if (positionals.length) usage(`使い方: ${commandUsage.emulate}`);
+      const args = { tabId: integer(options['-t'], '-t') };
+      const settings = ['--preset', '--size', '--dpr', '--mobile', '--touch', '--color-scheme', '--reduced-motion'];
+      const configured = settings.some((name) => options[name] !== undefined);
+      if (options['--reset'] && configured) usage('--reset と設定は同時に指定できません');
+      if (!options['--reset'] && !configured) usage('emulate の設定または --reset を指定してください');
+      if (options['--preset'] !== undefined) {
+        if (!['sp', 'tablet', 'pc'].includes(options['--preset'])) usage('--preset は sp / tablet / pc です');
+        args.preset = options['--preset'];
+      }
+      if (options['--size'] !== undefined) {
+        const size = /^(\d+)x(\d+)$/i.exec(options['--size']);
+        if (!size || size.slice(1).some((value) => !Number.isSafeInteger(Number(value)) || Number(value) <= 0 || Number(value) > 10000000)) usage('--size は正の整数 WxH で指定してください（各辺10000000以下）');
+        [args.width, args.height] = size.slice(1).map(Number);
+      }
+      if (options['--dpr'] !== undefined) {
+        const dpr = Number(options['--dpr']);
+        if (!options['--dpr'].trim() || !Number.isFinite(dpr) || dpr <= 0) usage('--dpr は正の数で指定してください');
+        args.dpr = dpr;
+      }
+      if (options['--color-scheme'] !== undefined) {
+        if (!['light', 'dark'].includes(options['--color-scheme'])) usage('--color-scheme は light / dark です');
+        args.colorScheme = options['--color-scheme'];
+      }
+      if (options['--mobile']) args.mobile = true;
+      if (options['--touch']) args.touch = true;
+      if (options['--reduced-motion']) args.reducedMotion = true;
+      if (options['--reset']) args.reset = true;
+      const result = await sendSelected(entries, options['-b'], 'emulate', args, options['--json']);
+      printResult('emulate', result, options['--json']);
+      return;
+    }
+
+    if (command === 'inspect') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--selector': 'value', '--ref': 'value', '--props': 'value', '--rules': true, '--json': true,
+      });
+      if (positionals.length || (options['--selector'] !== undefined) === (options['--ref'] !== undefined)) usage(`使い方: ${commandUsage.inspect}`);
+      const args = { tabId: integer(options['-t'], '-t') };
+      if (options['--selector'] !== undefined) {
+        if (!options['--selector'].trim()) usage('--selector が空です');
+        args.selector = options['--selector'];
+      }
+      if (options['--ref'] !== undefined) {
+        args.ref = integer(options['--ref'], '--ref');
+        if (!Number.isSafeInteger(args.ref) || args.ref < 0) usage('--ref は0以上の整数で指定してください');
+      }
+      if (options['--props'] !== undefined) {
+        args.props = options['--props'].split(',').map((value) => value.trim());
+        if (args.props.some((value) => !value)) usage('--props は空でないプロパティ名をカンマ区切りで指定してください');
+      }
+      if (options['--rules']) args.rules = true;
+      const result = await sendSelected(entries, options['-b'], 'inspect', args, options['--json']);
+      printResult('inspect', result, options['--json']);
+      return;
+    }
+
+    if (command === 'style') {
+      const { options, positionals } = parseOptions(argv, { ...common, '--css': 'value', '--id': 'value', '--json': true });
+      const action = positionals[0];
+      if (positionals.length !== 1 || !['add', 'clear'].includes(action)) usage(`使い方: ${commandUsage.style}`);
+      if (action === 'add' && (!options['--css'] || options['--id'] !== undefined)) usage(`使い方: ${commandUsage.style}`);
+      if (action === 'clear' && options['--css'] !== undefined) usage('style clear に --css は指定できません');
+      const args = { tabId: integer(options['-t'], '-t'), action };
+      if (action === 'add') args.css = options['--css'];
+      if (options['--id'] !== undefined) {
+        if (!options['--id'].trim()) usage('--id が空です');
+        args.id = options['--id'];
+      }
+      const result = await sendSelected(entries, options['-b'], 'style', args, options['--json']);
+      printResult('style', result, options['--json']);
+      return;
+    }
+
+    if (command === 'perf') {
+      const { options, positionals } = parseOptions(argv, { ...common, '--json': true });
+      if (positionals.length) usage(`使い方: ${commandUsage.perf}`);
+      const result = await sendSelected(entries, options['-b'], 'perf', { tabId: integer(options['-t'], '-t') }, options['--json']);
+      printResult('perf', result, options['--json']);
+      return;
+    }
+
+    if (command === 'read') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--html': true, '--selector': 'value', '--all-frames': true,
+        '--offset': 'value', '--max-chars': 'value',
+      });
+      if (positionals.length) usage('cb read に位置引数はありません');
+      const args = { tabId: integer(options['-t'], '-t') };
+      if (options['--html']) args.mode = 'html';
+      if (options['--selector'] !== undefined) args.selector = options['--selector'];
+      if (options['--all-frames']) args.allFrames = true;
+      if (options['--offset'] !== undefined) args.offset = integer(options['--offset'], '--offset');
+      if (options['--max-chars'] !== undefined) args.maxChars = integer(options['--max-chars'], '--max-chars');
+      const result = await sendSelected(entries, options['-b'], 'read', args, false);
+      printResult('read', result, false);
+      return;
+    }
+
+    if (command === 'elements') {
+      const { options, positionals } = parseOptions(argv, { ...common, '--viewport': true, '--json': true });
+      if (positionals.length) usage('cb elements に位置引数はありません');
+      const args = { tabId: integer(options['-t'], '-t') };
+      if (options['--viewport']) args.inViewportOnly = true;
+      const result = await sendSelected(entries, options['-b'], 'elements', args, options['--json']);
+      printResult('elements', result, options['--json']);
+      return;
+    }
+
+    if (command === 'scroll') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--by': 'value', '--top': true, '--bottom': true, '--ref': 'value', '--selector': 'value',
+      });
+      if (positionals.length) usage('cb scroll に位置引数はありません');
+      const choices = ['--by', '--top', '--bottom', '--ref', '--selector'].filter((name) => options[name] !== undefined);
+      if (choices.length !== 1) usage('scroll方法を1つ指定してください');
+      const args = { tabId: integer(options['-t'], '-t') };
+      if (options['--by'] !== undefined) args.by = { x: 0, y: integer(options['--by'], '--by') };
+      if (options['--top']) args.to = 'top';
+      if (options['--bottom']) args.to = 'bottom';
+      if (options['--ref'] !== undefined) args.ref = integer(options['--ref'], '--ref');
+      if (options['--selector'] !== undefined) args.selector = options['--selector'];
+      const result = await sendSelected(entries, options['-b'], 'scroll', args, false);
+      printResult('scroll', result, false);
+      return;
+    }
+
+    if (command === 'click') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--ref': 'value', '--xy': 'value', '--user-approved': true, '--allow-input': true, '--real': true,
+      });
+      if (positionals.length) usage('cb click に位置引数はありません');
+      const args = { tabId: integer(options['-t'], '-t') };
+      if ((options['--ref'] !== undefined) === (options['--xy'] !== undefined)) usage('--ref または --xy を指定してください');
+      if (options['--xy'] !== undefined) {
+        const parts = options['--xy'].split(',');
+        if (parts.length !== 2 || parts.some((part) => !part.trim() || !Number.isFinite(Number(part)))) usage('--xy は X,Y で指定してください');
+        [args.x, args.y] = parts.map(Number);
+      } else args.ref = integer(options['--ref'], '--ref');
+      if (options['--user-approved']) args.allowRisky = true;
+      if (options['--allow-input']) args.allowInput = true;
+      if (options['--real']) args.real = true;
+      const result = await sendSelected(entries, options['-b'], 'click', args, false);
+      printResult('click', result, false);
+      return;
+    }
+
+    if (command === 'type') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--ref': 'value', '--text': 'value', '--user-instructed': true, '--real': true,
+      });
+      if (positionals.length || options['--text'] === undefined || !options['--user-instructed']) {
+        usage('使い方: cb type -b <sel> -t <tabId> --ref N --text "..." --user-instructed');
+      }
+      const args = {
+        tabId: integer(options['-t'], '-t'),
+        ref: integer(options['--ref'], '--ref'),
+        text: options['--text'],
+        userInstructed: true,
+      };
+      if (options['--real']) args.real = true;
+      const result = await sendSelected(entries, options['-b'], 'type', args, false);
+      printResult('type', result, false);
+      return;
+    }
+
+    if (command === 'hover') {
+      const { options, positionals } = parseOptions(argv, { ...common, '--ref': 'value' });
+      if (positionals.length) usage('使い方: cb hover -b <sel> -t <tabId> --ref N');
+      const result = await sendSelected(entries, options['-b'], 'hover', {
+        tabId: integer(options['-t'], '-t'),
+        ref: integer(options['--ref'], '--ref'),
+      }, false);
+      printResult('hover', result, false);
+      return;
+    }
+
+    if (command === 'key') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--user-approved': true, '--allow-input': true,
+      });
+      if (positionals.length !== 1) usage('使い方: cb key -b <sel> -t <tabId> <key> [--user-approved] [--allow-input]');
+      const args = { tabId: integer(options['-t'], '-t'), key: positionals[0] };
+      if (options['--user-approved']) args.allowRisky = true;
+      if (options['--allow-input']) args.allowInput = true;
+      const result = await sendSelected(entries, options['-b'], 'key', args, false);
+      printResult('key', result, false);
+      return;
+    }
+
+    if (command === 'debug') {
+      const { options, positionals } = parseOptions(argv, common);
+      if (positionals.length !== 1 || !['start', 'stop'].includes(positionals[0])) {
+        usage('使い方: cb debug (start | stop) -b <sel> -t <tabId>');
+      }
+      const cmd = positionals[0] === 'start' ? 'debugStart' : 'debugStop';
+      const result = await sendSelected(entries, options['-b'], cmd, {
+        tabId: integer(options['-t'], '-t'),
+      }, false);
+      printResult(cmd, result, false);
+      return;
+    }
+
+    if (command === 'console' || command === 'network') {
+      const { options, positionals } = parseOptions(argv, {
+        ...common, '--pattern': 'value', '--clear': true, '--json': true,
+        ...(command === 'network' ? { '--detail': 'value', '--max-chars': 'value' } : {}),
+      });
+      if (positionals.length) usage(`cb ${command} に位置引数はありません`);
+      const args = { tabId: integer(options['-t'], '-t') };
+      if (options['--pattern'] !== undefined) args.pattern = options['--pattern'];
+      if (options['--clear']) args.clear = true;
+      if (options['--detail'] !== undefined) {
+        if (!options['--detail'].trim() || options['--clear'] || options['--pattern'] !== undefined) usage('--detail は --pattern / --clear と同時に指定できず、空でない requestId が必要です');
+        args.detail = options['--detail'];
+      }
+      if (options['--max-chars'] !== undefined) {
+        if (args.detail === undefined) usage('--max-chars には --detail が必要です');
+        args.maxChars = integer(options['--max-chars'], '--max-chars');
+        if (!Number.isSafeInteger(args.maxChars) || args.maxChars < 0) usage('--max-chars は0以上の整数で指定してください');
+      }
+      const result = await sendSelected(entries, options['-b'], command, args, options['--json']);
+      printResult(command, result, options['--json']);
+      return;
+    }
+
+    if (command === 'eval') {
+      const { options, positionals } = parseOptions(argv, common);
+      if (positionals.length !== 1) usage('使い方: cb eval -b <sel> -t <tabId> <式>');
+      const result = await sendSelected(entries, options['-b'], 'eval', {
+        tabId: integer(options['-t'], '-t'), expression: positionals[0],
+      }, false);
+      printResult('eval', result, false);
+      return;
+    }
+
+    if (command === 'doctor') {
+      const { options, positionals } = parseOptions(argv, { '--json': true });
+      if (positionals.length) usage('cb doctor に位置引数はありません');
+      printDoctor(entries, readFailures().slice(-20), options['--json']);
+      return;
+    }
+
+    if (command === 'selftest') {
+      const { options, positionals } = parseOptions(argv, { '-b': 'value' });
+      if (positionals.length || !options['-b']) usage('使い方: cb selftest -b <sel>');
+      const entry = select(entries, options['-b']);
+      const { runSelftest } = require('./selftest');
+      process.exitCode = await runSelftest({
+        entry,
+        request: (_socket, cmd, args) => requestEntry(entry, cmd, args),
+      });
+      return;
+    }
+
+    if (command === 'activate') {
+      const { options, positionals } = parseOptions(argv, common);
+      if (positionals.length) usage('使い方: cb activate -b <sel> -t <tabId>');
+      const result = await sendSelected(entries, options['-b'], 'activate', {
+        tabId: integer(options['-t'], '-t'),
+      }, false);
+      printResult('activate', result, false);
+      return;
+    }
+
+    if (command === 'reload') {
+      const { options, positionals } = parseOptions(argv, { '-b': 'value' });
+      if (positionals.length) usage('使い方: cb reload [-b <sel>]');
+      const targets = options['-b'] ? [select(entries, options['-b'])] : entries;
+      for (const entry of targets) {
+        const response = await requestEntry(entry, 'reload', {});
+        process.stdout.write(`${entry.browser.email || entry.browser.instanceId.slice(0, 8)}\t${response.ok ? '再読み込み' : response.error.code}\n`);
+      }
+      return;
+    }
+
+    if (command === 'screenshot') {
+      const { options, positionals } = parseOptions(argv, { '-b': 'value', '-t': 'value', '--out': 'value', '--full': true });
+      if (positionals.length || !options['--out']) usage(`使い方: ${commandUsage.screenshot}`);
+      const result = await sendSelected(entries, options['-b'], 'screenshot', {
+        tabId: integer(options['-t'], '-t'),
+        ...(options['--full'] ? { full: true } : {}),
+      }, false);
+      const match = /^data:image\/png;base64,(.+)$/s.exec(result.dataUrl || '');
+      if (!match) throw new CliError('screenshotのdataUrlが不正です', 1);
+      fs.writeFileSync(options['--out'], Buffer.from(match[1], 'base64'));
+      process.stdout.write(`${options['--out']}\n`);
+      return;
+    }
+
+    usage('コマンドを指定してください');
+  } finally {
+    closeEntries(entries);
+  }
+}
+
+main().catch((error) => {
+  if (error.remote && error.json) process.stderr.write(`${JSON.stringify(error.remote)}\n`);
+  else {
+    process.stderr.write(`${error.message}\n`);
+    const detail = error.remote?.detail;
+    if (detail && Object.keys(detail).length) process.stderr.write(`${JSON.stringify(detail)}\n`);
+  }
+  process.exitCode = error.exitCode || 1;
+});
